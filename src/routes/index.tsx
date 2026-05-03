@@ -203,7 +203,7 @@ function Dashboard() {
               return (
                 <button key={f.id} onClick={() => { setSource(f.src); setDestination(f.dst); }}
                   className="flex w-full items-center justify-between rounded-lg border border-border/60 bg-background/30 px-3 py-2 text-left text-xs hover:bg-accent/10">
-                  <span className="truncate">{a.label} -> {b.label}</span>
+                  <span className="truncate">{a.label} → {b.label}</span>
                   <Zap className="h-3 w-3 text-primary" />
                 </button>
               );
