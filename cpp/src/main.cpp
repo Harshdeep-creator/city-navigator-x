@@ -8,9 +8,12 @@
 #include "lru_cache.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <string>
+#include <vector>
 
 using namespace urbanflow;
 

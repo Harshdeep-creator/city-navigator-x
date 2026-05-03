@@ -1,4 +1,6 @@
 #include "dijkstra.hpp"
+#include <algorithm>
+#include <cmath>
 #include <queue>
 #include <vector>
 #include <limits>
