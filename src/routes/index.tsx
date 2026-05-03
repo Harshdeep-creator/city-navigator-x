@@ -180,7 +180,7 @@ function Dashboard() {
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-background">
       {/* Map */}
-      <div className="absolute inset-0">
+      <div className="absolute inset-0 z-0 isolate">
         <MapCanvas
           nodes={nodes} edges={edges}
           primary={primary} alternatives={alternatives}
