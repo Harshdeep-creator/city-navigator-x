@@ -1,247 +1,292 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CityMap } from "@/components/CityMap";
-import { ControlPanel } from "@/components/ControlPanel";
+import { motion } from "framer-motion";
+import { Activity, Clock, Moon, Sun } from "lucide-react";
+import { MapCanvas } from "@/components/MapCanvas";
+import { Sidebar } from "@/components/Sidebar";
 import { AnalyticsPanel } from "@/components/AnalyticsPanel";
 import { AlertsFeed, type Alert } from "@/components/AlertsFeed";
+import { AlgorithmInsights } from "@/components/AlgorithmInsights";
+import { SimulationControls, type SimFlags } from "@/components/SimulationControls";
+import { CppReferenceButton } from "@/components/CppReference";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
-import { Activity, Moon, Sun, Zap, Clock, Star } from "lucide-react";
-import { buildCity, dijkstra, kAlternatives, peakFactorFor, RouteCache, type DijkstraResult, type Edge } from "@/lib/traffic-engine";
+import {
+  buildDelhi, dijkstra, kAlternatives, peakFactorFor, RouteCache,
+  SegmentTree, floydWarshall,
+  type DijkstraResult, type Edge,
+} from "@/lib/traffic-engine";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "UrbanFlow AI — Predictive route optimization" },
-      { name: "description", content: "Real-time traffic intelligence with Dijkstra routing, segment-tree updates, and predictive peak-hour modeling." },
-      { property: "og:title", content: "UrbanFlow AI — Predictive route optimization" },
-      { property: "og:description", content: "A smarter, faster Google Maps built on graph algorithms and predictive traffic modeling." },
+      { title: "UrbanFlow AI — Predictive Delhi NCR routing" },
+      { name: "description", content: "Real-time traffic intelligence for Delhi NCR with Dijkstra, Floyd–Warshall, segment-tree updates and predictive peak-hour modeling." },
+      { property: "og:title", content: "UrbanFlow AI — Predictive Delhi NCR routing" },
+      { property: "og:description", content: "Google Maps-style traffic intelligence powered by competitive-programming graph algorithms." },
     ],
   }),
   component: Dashboard,
 });
 
+type Mode = "fastest" | "shortest" | "predictive";
+
+type Incident = { id: string; kind: Alert["kind"]; lat: number; lng: number };
+
 function Dashboard() {
-  const { nodes, edges: initialEdges } = useMemo(() => buildCity(), []);
-  const [edges, setEdges] = useState<Edge[]>(initialEdges);
-  const [source, setSource] = useState<string | null>("n_0_0");
-  const [destination, setDestination] = useState<string | null>("n_5_4");
+  const { nodes, edges: initial } = useMemo(() => buildDelhi(), []);
+  const [edges, setEdges] = useState<Edge[]>(initial);
+  const [source, setSource] = useState<string | null>("igi");
+  const [destination, setDestination] = useState<string | null>("n62");
   const [avoidTraffic, setAvoidTraffic] = useState(true);
   const [avoidTolls, setAvoidTolls] = useState(false);
-  const [fastest, setFastest] = useState(true);
+  const [mode, setMode] = useState<Mode>("fastest");
   const [hour, setHour] = useState(9);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [favorites, setFavorites] = useState<{ id: string; src: string; dst: string }[]>([]);
+  const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [flags, setFlags] = useState<SimFlags>({
+    rain: false, festival: false, accidentInject: false, roadblock: false, peakOffice: false,
+  });
   const [density, setDensity] = useState<{ t: number; v: number }[]>(() =>
-    Array.from({ length: 30 }, (_, i) => ({ t: i, v: 0.3 }))
-  );
+    Array.from({ length: 30 }, (_, i) => ({ t: i, v: 0.3 })));
   const [travelTimes, setTravelTimes] = useState<{ t: number; v: number }[]>(() =>
-    Array.from({ length: 30 }, (_, i) => ({ t: i, v: 0 }))
-  );
+    Array.from({ length: 30 }, (_, i) => ({ t: i, v: 0 })));
+  const [responseMs, setResponseMs] = useState(0);
+  const [segUpdates, setSegUpdates] = useState(0);
+  const [rerouteTriggers, setRerouteTriggers] = useState(0);
+  const [concurrentUsers, setConcurrentUsers] = useState(184);
   const cacheRef = useRef(new RouteCache());
   const tickRef = useRef(0);
 
-  // theme switching
+  // theme
   useEffect(() => {
     document.documentElement.classList.toggle("light", theme === "light");
   }, [theme]);
 
-  const peak = peakFactorFor(hour);
+  const peak = peakFactorFor(hour) * (flags.peakOffice ? 1.25 : 1);
+  const weatherMult = flags.rain ? 1.35 : 1;
+  const festivalMult = flags.festival ? 1.4 : 1;
 
-  // primary + alternatives
+  const opts = useMemo(() => ({
+    avoidTraffic, avoidTolls,
+    fastest: mode !== "shortest",
+    predictive: mode === "predictive",
+    weatherMult, festivalMult,
+  }), [avoidTraffic, avoidTolls, mode, weatherMult, festivalMult]);
+
   const alternatives = useMemo(() => {
     if (!source || !destination) return [];
-    return kAlternatives(nodes, edges, source, destination, 3, peak, { avoidTraffic });
-  }, [nodes, edges, source, destination, peak, avoidTraffic]);
+    return kAlternatives(nodes, edges, source, destination, 3, peak, opts);
+  }, [nodes, edges, source, destination, peak, opts]);
 
   const primary: DijkstraResult | null = useMemo(() => {
     if (!source || !destination) return null;
     const cache = cacheRef.current;
-    const key = cache.key(source, destination, peak, { avoidTraffic });
+    const key = cache.key(source, destination, peak, opts);
     const hit = cache.get(key);
     if (hit !== undefined) return hit;
-    const r = dijkstra(nodes, edges, source, destination, peak, { avoidTraffic });
+    const t0 = performance.now();
+    const r = dijkstra(nodes, edges, source, destination, peak, opts);
+    setResponseMs(performance.now() - t0);
     cache.set(key, r);
     return r;
-  }, [nodes, edges, source, destination, peak, avoidTraffic]);
+  }, [nodes, edges, source, destination, peak, opts]);
 
-  // Real-time traffic simulation: random walk + decay (segment-tree style point updates).
+  // Floyd-Warshall once for telemetry
+  const fw = useMemo(() => floydWarshall(nodes, edges), [nodes, edges]);
+
+  // segment tree for congestion bursts (range updates)
   useEffect(() => {
     const id = setInterval(() => {
       tickRef.current += 1;
       setEdges(prev => {
-        const next = prev.map(e => {
-          let c = e.congestion + (Math.random() - 0.5) * 0.08;
-          c = Math.max(0, Math.min(1, c * 0.96));
+        const arr = prev.map(e => e.congestion);
+        const seg = new SegmentTree(arr);
+        const bursts = 1 + Math.floor(Math.random() * 3);
+        for (let i = 0; i < bursts; i++) {
+          const l = Math.floor(Math.random() * arr.length);
+          const r = Math.min(arr.length - 1, l + Math.floor(Math.random() * 4));
+          seg.rangeAdd(l, r, (Math.random() - 0.5) * 0.18);
+        }
+        setSegUpdates(bursts);
+        return prev.map((e, i) => {
+          let c = arr[i] + (Math.random() - 0.5) * 0.06;
+          // segment tree contribution
+          const m = seg.queryMax(i, i);
+          c = (c + m) / 2;
+          c = Math.max(0.05, Math.min(1, c * 0.97));
           return { ...e, congestion: c };
         });
-        return next;
       });
-      cacheRef.current = new RouteCache(); // invalidate
-    }, 1500);
+      cacheRef.current.reset();
+      setConcurrentUsers(u => Math.max(80, Math.min(420, u + Math.round((Math.random() - 0.5) * 14))));
+    }, 1800);
     return () => clearInterval(id);
   }, []);
 
-  // density + travel-time charts
+  // charts feed
   useEffect(() => {
     const avg = edges.reduce((s, e) => s + e.congestion, 0) / edges.length;
     setDensity(d => [...d.slice(1), { t: tickRef.current, v: Number(avg.toFixed(3)) }]);
     setTravelTimes(d => [...d.slice(1), { t: tickRef.current, v: primary ? Math.round(primary.totalTime) : 0 }]);
   }, [edges, primary]);
 
-  // random alerts
+  // alerts + incidents
   useEffect(() => {
     const id = setInterval(() => {
-      const r = Math.random();
-      if (r < 0.55) return;
-      const kinds: Alert["kind"][] = ["accident", "closure", "spike"];
-      const kind = kinds[Math.floor(Math.random() * kinds.length)];
+      const trigger = flags.accidentInject || flags.roadblock || Math.random() > 0.5;
+      if (!trigger) return;
       const e = edges[Math.floor(Math.random() * edges.length)];
       const a = nodes.find(n => n.id === e.from)!; const b = nodes.find(n => n.id === e.to)!;
-      const msg = `${a.label} -> ${b.label}`;
-      const newAlert: Alert = { id: `${Date.now()}_${Math.random()}`, kind, message: msg, ts: Date.now() };
-      setAlerts(prev => [newAlert, ...prev].slice(0, 5));
+      const kinds: Alert["kind"][] = flags.roadblock ? ["closure"] : flags.accidentInject ? ["accident"] : ["accident", "closure", "spike"];
+      const kind = kinds[Math.floor(Math.random() * kinds.length)];
+      const newAlert: Alert = { id: `${Date.now()}_${Math.random()}`, kind, message: `${a.label} → ${b.label}`, ts: Date.now() };
+      setAlerts(prev => [newAlert, ...prev].slice(0, 6));
+      const inc: Incident = { id: newAlert.id, kind, lat: (a.lat + b.lat) / 2, lng: (a.lng + b.lng) / 2 };
+      setIncidents(prev => [inc, ...prev].slice(0, 8));
+      setRerouteTriggers(r => r + 1);
       if (kind === "closure") {
         setEdges(prev => prev.map(x => x.id === e.id ? { ...x, closed: true } : x));
-        setTimeout(() => setEdges(prev => prev.map(x => x.id === e.id ? { ...x, closed: false } : x)), 9000);
+        setTimeout(() => setEdges(prev => prev.map(x => x.id === e.id ? { ...x, closed: false } : x)), 10000);
+        setTimeout(() => setIncidents(prev => prev.filter(i => i.id !== inc.id)), 10000);
       } else if (kind === "spike") {
         setEdges(prev => prev.map(x => x.id === e.id ? { ...x, congestion: Math.min(1, x.congestion + 0.5) } : x));
+        setTimeout(() => setIncidents(prev => prev.filter(i => i.id !== inc.id)), 9000);
+      } else {
+        setTimeout(() => setIncidents(prev => prev.filter(i => i.id !== inc.id)), 12000);
       }
-    }, 6000);
+    }, 5500);
     return () => clearInterval(id);
-  }, [edges, nodes]);
+  }, [edges, nodes, flags]);
 
   const handleNodeClick = (id: string) => {
-    if (!source || (source && destination)) {
-      setSource(id); setDestination(null);
-    } else if (source && !destination && id !== source) {
-      setDestination(id);
-    }
+    if (!source || (source && destination)) { setSource(id); setDestination(null); }
+    else if (source && !destination && id !== source) { setDestination(id); }
   };
 
-  const onOptimize = () => {
-    cacheRef.current = new RouteCache();
-    setEdges(e => [...e]); // trigger
-  };
+  const onOptimize = () => { cacheRef.current.reset(); setEdges(e => [...e]); };
 
-  const saveFavorite = () => {
-    if (!source || !destination) return;
-    const id = `${source}_${destination}`;
-    if (favorites.find(f => f.id === id)) return;
-    setFavorites([{ id, src: source, dst: destination }, ...favorites].slice(0, 4));
-  };
+  const cache = cacheRef.current;
+  const V = nodes.length, E = edges.length;
+  const graphDensity = (2 * E) / (V * (V - 1));
+  const activeAlgo = mode === "predictive"
+    ? "Dijkstra + Predictive DP"
+    : flags.roadblock ? "Greedy Reroute"
+    : flags.accidentInject ? "Segment-Tree Update + Dijkstra"
+    : "Dijkstra (binary heap)";
+  const predictionConfidence = 70 + (1 - Math.min(1, density[density.length - 1]?.v ?? 0)) * 25;
 
   return (
-    <div className="relative min-h-screen w-full overflow-hidden">
+    <div className="relative h-screen w-screen overflow-hidden bg-background">
+      {/* Map */}
+      <div className="absolute inset-0">
+        <MapCanvas
+          nodes={nodes} edges={edges}
+          primary={primary} alternatives={alternatives}
+          source={source} destination={destination}
+          incidents={incidents} theme={theme}
+          onNodeClick={handleNodeClick}
+        />
+      </div>
+
       {/* Top bar */}
-      <header className="absolute inset-x-0 top-0 z-30 flex items-center justify-between p-4">
-        <div className="glass flex items-center gap-3 rounded-2xl px-4 py-2.5">
-          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-accent">
+      <header className="pointer-events-none absolute inset-x-0 top-0 z-40 flex items-start justify-between p-4">
+        <motion.div initial={{ y: -16, opacity: 0 }} animate={{ y: 0, opacity: 1 }}
+          className="glass pointer-events-auto flex items-center gap-3 rounded-2xl px-4 py-2.5 shadow-xl">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-accent">
             <Activity className="h-4 w-4 text-primary-foreground" />
           </div>
           <div>
             <div className="text-sm font-semibold tracking-tight">UrbanFlow AI</div>
-            <div className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Predictive routing</div>
+            <div className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Delhi NCR · Predictive routing</div>
           </div>
-        </div>
+        </motion.div>
 
-        <div className="glass flex items-center gap-3 rounded-2xl px-3 py-2">
+        <motion.div initial={{ y: -16, opacity: 0 }} animate={{ y: 0, opacity: 1 }}
+          className="glass pointer-events-auto flex items-center gap-3 rounded-2xl px-4 py-2 shadow-xl">
           <Clock className="h-4 w-4 text-muted-foreground" />
-          <div className="w-48">
-            <Slider value={[hour]} min={0} max={23.99} step={0.25} onValueChange={v => setHour(v[0])} />
+          <div className="w-56">
+            <Slider value={[hour]} min={6} max={23} step={0.25} onValueChange={v => setHour(v[0])} />
           </div>
-          <div className="w-16 text-right text-xs tabular-nums text-muted-foreground">
+          <div className="w-14 text-right text-xs tabular-nums text-muted-foreground">
             {String(Math.floor(hour)).padStart(2, "0")}:{String(Math.floor((hour % 1) * 60)).padStart(2, "0")}
           </div>
-          <div className="rounded-md bg-primary/15 px-2 py-0.5 text-[10px] font-medium text-primary">
-            Peak x{peak.toFixed(2)}
+          <div className="rounded-md bg-primary/15 px-2 py-0.5 text-[10px] font-semibold text-primary">
+            Peak ×{peak.toFixed(2)}
           </div>
-        </div>
+        </motion.div>
 
-        <div className="flex items-center gap-2">
+        <motion.div initial={{ y: -16, opacity: 0 }} animate={{ y: 0, opacity: 1 }}
+          className="pointer-events-auto flex items-center gap-2">
+          <CppReferenceButton />
           <Button variant="outline" size="icon" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-            className="glass border-border/40 h-10 w-10">
+            className="glass h-10 w-10 border-border/40">
             {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
           </Button>
-        </div>
+        </motion.div>
       </header>
 
-      {/* Map */}
-      <main className="absolute inset-0">
-        <CityMap nodes={nodes} edges={edges} primary={primary} alternatives={alternatives}
-          source={source} destination={destination} onNodeClick={handleNodeClick} />
-      </main>
+      {/* Left sidebar */}
+      <div className="absolute left-0 top-20 bottom-4 z-30">
+        <Sidebar
+          nodes={nodes}
+          source={source} destination={destination}
+          setSource={setSource} setDestination={setDestination}
+          avoidTraffic={avoidTraffic} setAvoidTraffic={setAvoidTraffic}
+          avoidTolls={avoidTolls} setAvoidTolls={setAvoidTolls}
+          mode={mode} setMode={setMode}
+          onOptimize={onOptimize}
+        />
+      </div>
 
-      {/* Left panel */}
-      <aside className="absolute left-4 top-24 bottom-4 z-20 w-[340px] animate-float-in">
-        <div className="glass flex h-full flex-col rounded-2xl p-4">
-          <ControlPanel
-            nodes={nodes}
-            source={source} destination={destination}
-            setSource={setSource} setDestination={setDestination}
-            avoidTraffic={avoidTraffic} setAvoidTraffic={setAvoidTraffic}
-            avoidTolls={avoidTolls} setAvoidTolls={setAvoidTolls}
-            fastest={fastest} setFastest={setFastest}
-            onOptimize={onOptimize}
+      {/* Right analytics */}
+      <motion.aside
+        initial={{ x: 30, opacity: 0 }} animate={{ x: 0, opacity: 1 }}
+        className="absolute right-3 top-20 bottom-4 z-30 w-[360px]">
+        <div className="glass flex h-full flex-col gap-3 overflow-y-auto rounded-2xl p-3 shadow-2xl">
+          <AnalyticsPanel primary={primary} alternatives={alternatives} density={density} travelTimes={travelTimes} />
+
+          <div>
+            <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Simulation controls</div>
+            <SimulationControls flags={flags} setFlags={setFlags} />
+          </div>
+
+          <AlgorithmInsights
+            vertices={V} edges={E} density={graphDensity}
+            cacheHits={cache.hits} cacheMisses={cache.misses} cacheSize={cache.size()}
+            segUpdatesPerSec={segUpdates} rerouteTriggers={rerouteTriggers}
+            activeAlgo={activeAlgo} nodesExplored={primary?.nodesExplored ?? 0}
+            responseMs={responseMs} fwIterations={fw.iterations}
+            concurrentUsers={concurrentUsers} predictionConfidence={predictionConfidence}
           />
 
-          <div className="my-4 border-t border-border/60" />
-
-          <div className="flex items-center justify-between">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Saved routes</h3>
-            <button onClick={saveFavorite} className="flex items-center gap-1 text-xs text-primary hover:text-primary/80">
-              <Star className="h-3 w-3" /> Save
-            </button>
-          </div>
-          <div className="mt-2 space-y-1.5 overflow-y-auto">
-            {favorites.length === 0 && (
-              <div className="text-xs text-muted-foreground">Pin frequently used routes for one-tap recall.</div>
-            )}
-            {favorites.map(f => {
-              const a = nodes.find(n => n.id === f.src)!; const b = nodes.find(n => n.id === f.dst)!;
-              return (
-                <button key={f.id} onClick={() => { setSource(f.src); setDestination(f.dst); }}
-                  className="flex w-full items-center justify-between rounded-lg border border-border/60 bg-background/30 px-3 py-2 text-left text-xs hover:bg-accent/10">
-                  <span className="truncate">{a.label} → {b.label}</span>
-                  <Zap className="h-3 w-3 text-primary" />
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      </aside>
-
-      {/* Right panel */}
-      <aside className="absolute right-4 top-24 bottom-4 z-20 w-[340px] animate-float-in">
-        <div className="glass flex h-full flex-col gap-4 overflow-y-auto rounded-2xl p-4">
-          <AnalyticsPanel primary={primary} alternatives={alternatives} density={density} travelTimes={travelTimes} />
           <div>
-            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Live alerts</h3>
+            <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Live alerts</div>
             <AlertsFeed alerts={alerts} onDismiss={(id) => setAlerts(a => a.filter(x => x.id !== id))} />
           </div>
         </div>
-      </aside>
+      </motion.aside>
 
       {/* Bottom legend */}
-      <div className="absolute bottom-4 left-1/2 z-20 -translate-x-1/2 animate-float-in">
-        <div className="glass flex items-center gap-4 rounded-full px-5 py-2 text-xs">
-          <LegendDot color="var(--color-traffic-low)" label="Low traffic" />
-          <LegendDot color="var(--color-traffic-mid)" label="Moderate" />
-          <LegendDot color="var(--color-traffic-high)" label="Heavy" />
+      <div className="pointer-events-none absolute bottom-3 left-1/2 z-30 -translate-x-1/2">
+        <div className="glass pointer-events-auto flex items-center gap-4 rounded-full px-5 py-2 text-[11px] shadow-xl">
+          <Dot c="#22c55e" l="Optimal" />
+          <Dot c="#f59e0b" l="Alt 1" />
+          <Dot c="#ef4444" l="Congested" />
           <span className="text-muted-foreground">·</span>
-          <span className="text-muted-foreground">Dijkstra · Segment updates · DP cache · Peak-hour predictor</span>
+          <span className="text-muted-foreground">Dijkstra · Floyd–Warshall · Segment tree · DP cache · Greedy reroute</span>
         </div>
       </div>
     </div>
   );
 }
 
-function LegendDot({ color, label }: { color: string; label: string }) {
+function Dot({ c, l }: { c: string; l: string }) {
   return (
     <span className="flex items-center gap-1.5">
-      <span className="h-2.5 w-2.5 rounded-full" style={{ background: color }} />
-      <span>{label}</span>
+      <span className="h-2.5 w-2.5 rounded-full" style={{ background: c, boxShadow: `0 0 8px ${c}` }} />
+      <span>{l}</span>
     </span>
   );
 }
